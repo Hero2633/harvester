@@ -8,6 +8,7 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 
@@ -23,6 +24,11 @@ const (
 
 	// StatePending represents kubevirt MigrationPhaseUnset, MigrationPending
 	StatePending = "Pending migration"
+
+	// storageMigrationSourcePodRetryInterval is the requeue interval while waiting for the source pod to reach Succeeded
+	storageMigrationSourcePodRetryInterval = 5 * time.Second
+	// storageMigrationSourcePodCleanupTimeout is the max wait duration for the source pod to reach Succeeded to avoid infinite retries
+	storageMigrationSourcePodCleanupTimeout = 5 * time.Minute
 )
 
 // The handler adds the AnnotationMigrationUID annotation to the VMI when vmim starts.
@@ -106,7 +112,68 @@ func (h *Handler) handleFinishedMigration(vmi *kubevirtv1.VirtualMachineInstance
 		logrus.Infof("vmim %s/%s is on phase %s but fail to reset vmi %s state %s", vmim.Namespace, vmim.Name, vmim.Status.Phase, vmi.Name, err.Error())
 		return nil, err
 	}
+	if err := h.cleanupStorageMigrationSourcePod(vmim); err != nil {
+		logrus.Infof("vmim %s/%s is on phase %s but fail to cleanup storage migration source pod %s", vmim.Namespace, vmim.Name, vmim.Status.Phase, err.Error())
+		return nil, err
+	}
 	return vmim, nil
+}
+
+// cleanupStorageMigrationSourcePod deletes the completed source virt-launcher pod after a live storage migration succeeds,
+// preventing the kubernetes.io/pvc-protection finalizer from blocking deletion of the source PVC.
+// It only applies to succeeded volume-update migrations (labeled with kubevirt.io/volume-update-migration), leaving normal migrations unaffected.
+func (h *Handler) cleanupStorageMigrationSourcePod(vmim *kubevirtv1.VirtualMachineInstanceMigration) error {
+	if vmim.Status.Phase != kubevirtv1.MigrationSucceeded {
+		return nil
+	}
+	if vmim.Labels[kubevirtv1.VolumesUpdateMigration] == "" {
+		return nil
+	}
+
+	state := vmim.Status.MigrationState
+	if state == nil || !state.Completed || state.Failed {
+		return nil
+	}
+
+	sourcePodName := state.SourcePod
+	if sourcePodName == "" || sourcePodName == state.TargetPod {
+		return nil
+	}
+
+	pod, err := h.podCache.Get(vmim.Namespace, sourcePodName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to get storage migration source pod %s/%s: %w", vmim.Namespace, sourcePodName, err)
+	}
+	if pod.DeletionTimestamp != nil {
+		return nil
+	}
+
+	if pod.Status.Phase != corev1.PodSucceeded {
+		// Only clean up pods that exited normally; keep Failed pods for troubleshooting
+		if pod.Status.Phase == corev1.PodFailed {
+			logrus.Warnf("skip cleaning up failed source pod %s/%s for storage migration %s", vmim.Namespace, pod.Name, vmim.Name)
+			return nil
+		}
+		// The source pod may still be shutting down right after migration succeeds; requeue briefly and stop after timeout
+		if state.EndTimestamp != nil && time.Since(state.EndTimestamp.Time) > storageMigrationSourcePodCleanupTimeout {
+			logrus.Warnf("timed out waiting for storage migration source pod %s/%s (phase=%s) to reach Succeeded for vmim %s",
+				vmim.Namespace, pod.Name, pod.Status.Phase, vmim.Name)
+			return nil
+		}
+		if h.vmimController != nil {
+			h.vmimController.EnqueueAfter(vmim.Namespace, vmim.Name, storageMigrationSourcePodRetryInterval)
+		}
+		return nil
+	}
+
+	logrus.Infof("deleting completed source pod %s/%s after storage migration %s succeeded", vmim.Namespace, pod.Name, vmim.Name)
+	if err := h.pods.Delete(vmim.Namespace, pod.Name, &metav1.DeleteOptions{}); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("failed to delete storage migration source pod %s/%s: %w", vmim.Namespace, pod.Name, err)
+	}
+	return nil
 }
 
 func (h *Handler) setVmiMigrationUIDAnnotation(vmi *kubevirtv1.VirtualMachineInstance, UID string, state string) error {

@@ -6,16 +6,20 @@ import (
 	"fmt"
 	"runtime"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	fakecore "k8s.io/client-go/kubernetes/fake"
 	kubevirtv1 "kubevirt.io/api/core/v1"
 	kubevirthypervisor "kubevirt.io/kubevirt/pkg/hypervisor"
 
 	fakegenerated "github.com/harvester/harvester/pkg/generated/clientset/versioned/fake"
+	ctlvirtv1 "github.com/harvester/harvester/pkg/generated/controllers/kubevirt.io/v1"
 	"github.com/harvester/harvester/pkg/util"
 	"github.com/harvester/harvester/pkg/util/fakeclients"
 	rqutils "github.com/harvester/harvester/pkg/util/resourcequota"
@@ -1301,6 +1305,338 @@ func TestHandler_OnVmimChanged_WithResourceQuota_WithCompensationResult(t *testi
 			// when test code runs, it has output like below line:
 			// INFO[0000] compensateResourceQuotaBase: compensate resource quota rq1 in namespace rs for vm vm1 : map[limits.memory:{{555745096 0} {<nil>}  BinarySI}]
 			assert.Equal(t, tt.hasCompensation, rqutils.HasMigratingCompensation(rq), "case %q", tt.name)
+		})
+	}
+}
+
+type fakeVMIMController struct {
+	ctlvirtv1.VirtualMachineInstanceMigrationController
+	enqueuedAfter []string
+}
+
+func (f *fakeVMIMController) EnqueueAfter(namespace, name string, _ time.Duration) {
+	f.enqueuedAfter = append(f.enqueuedAfter, namespace+"/"+name)
+}
+
+func TestHandler_OnVmimChanged_CleanupStorageMigrationSourcePod(t *testing.T) {
+	const (
+		ns            = "default"
+		vmName        = "vm1"
+		vmimName      = "vmim-storage"
+		sourcePodName = "virt-launcher-vm1-source"
+		targetPodName = "virt-launcher-vm1-target"
+		sourcePodUID  = types.UID("source-pod-uid")
+		targetPodUID  = types.UID("target-pod-uid")
+	)
+
+	now := v1.Now()
+	expiredEndTime := v1.NewTime(time.Now().Add(-storageMigrationSourcePodCleanupTimeout - time.Minute))
+
+	tests := []struct {
+		name               string
+		vmi                *kubevirtv1.VirtualMachineInstance
+		vmim               *kubevirtv1.VirtualMachineInstanceMigration
+		sourcePod          *corev1.Pod
+		expectPodDeleted   bool
+		expectEnqueueAfter bool
+	}{
+		{
+			name: "delete completed source pod after storage migration succeeded",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{targetPodUID: "node-2"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      vmimName,
+					Namespace: ns,
+					UID:       vmimUID,
+					Labels:    map[string]string{kubevirtv1.VolumesUpdateMigration: vmName},
+				},
+				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationSucceeded,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &now,
+					},
+				},
+			},
+			sourcePod: &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: sourcePodName, Namespace: ns, UID: sourcePodUID},
+				Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+			},
+			expectPodDeleted:   true,
+			expectEnqueueAfter: false,
+		},
+		{
+			name: "keep source pod for normal migration without volume update label",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{targetPodUID: "node-2"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{Name: vmimName, Namespace: ns, UID: vmimUID},
+				Spec:       kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationSucceeded,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &now,
+					},
+				},
+			},
+			sourcePod: &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: sourcePodName, Namespace: ns, UID: sourcePodUID},
+				Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+			},
+			expectPodDeleted:   false,
+			expectEnqueueAfter: false,
+		},
+		{
+			name: "keep source pod when storage migration failed",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{sourcePodUID: "node-1"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      vmimName,
+					Namespace: ns,
+					UID:       vmimUID,
+					Labels:    map[string]string{kubevirtv1.VolumesUpdateMigration: vmName},
+				},
+				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationFailed,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						Failed:       true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &now,
+					},
+				},
+			},
+			sourcePod: &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: sourcePodName, Namespace: ns, UID: sourcePodUID},
+				Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+			expectPodDeleted:   false,
+			expectEnqueueAfter: false,
+		},
+		{
+			name: "requeue when source pod is still running after storage migration succeeded",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{targetPodUID: "node-2"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      vmimName,
+					Namespace: ns,
+					UID:       vmimUID,
+					Labels:    map[string]string{kubevirtv1.VolumesUpdateMigration: vmName},
+				},
+				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationSucceeded,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &now,
+					},
+				},
+			},
+			sourcePod: &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: sourcePodName, Namespace: ns, UID: sourcePodUID},
+				Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+			expectPodDeleted:   false,
+			expectEnqueueAfter: true,
+		},
+		{
+			name: "stop retrying when waiting for source pod exceeds timeout",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{targetPodUID: "node-2"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      vmimName,
+					Namespace: ns,
+					UID:       vmimUID,
+					Labels:    map[string]string{kubevirtv1.VolumesUpdateMigration: vmName},
+				},
+				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationSucceeded,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &expiredEndTime,
+					},
+				},
+			},
+			sourcePod: &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: sourcePodName, Namespace: ns, UID: sourcePodUID},
+				Status:     corev1.PodStatus{Phase: corev1.PodRunning},
+			},
+			expectPodDeleted:   false,
+			expectEnqueueAfter: false,
+		},
+		{
+			name: "delete completed source pod even when still listed in VMI ActivePods",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{sourcePodUID: "node-1", targetPodUID: "node-2"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      vmimName,
+					Namespace: ns,
+					UID:       vmimUID,
+					Labels:    map[string]string{kubevirtv1.VolumesUpdateMigration: vmName},
+				},
+				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationSucceeded,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &now,
+					},
+				},
+			},
+			sourcePod: &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: sourcePodName, Namespace: ns, UID: sourcePodUID},
+				Status:     corev1.PodStatus{Phase: corev1.PodSucceeded},
+			},
+			expectPodDeleted:   true,
+			expectEnqueueAfter: false,
+		},
+		{
+			name: "keep failed source pod without retrying",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{targetPodUID: "node-2"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      vmimName,
+					Namespace: ns,
+					UID:       vmimUID,
+					Labels:    map[string]string{kubevirtv1.VolumesUpdateMigration: vmName},
+				},
+				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationSucceeded,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &now,
+					},
+				},
+			},
+			sourcePod: &corev1.Pod{
+				ObjectMeta: v1.ObjectMeta{Name: sourcePodName, Namespace: ns, UID: sourcePodUID},
+				Status:     corev1.PodStatus{Phase: corev1.PodFailed},
+			},
+			expectPodDeleted:   false,
+			expectEnqueueAfter: false,
+		},
+		{
+			name: "idempotent when source pod is already gone",
+			vmi: &kubevirtv1.VirtualMachineInstance{
+				ObjectMeta: v1.ObjectMeta{Name: vmName, Namespace: ns, UID: uid},
+				Status: kubevirtv1.VirtualMachineInstanceStatus{
+					ActivePods: map[types.UID]string{targetPodUID: "node-2"},
+				},
+			},
+			vmim: &kubevirtv1.VirtualMachineInstanceMigration{
+				ObjectMeta: v1.ObjectMeta{
+					Name:      vmimName,
+					Namespace: ns,
+					UID:       vmimUID,
+					Labels:    map[string]string{kubevirtv1.VolumesUpdateMigration: vmName},
+				},
+				Spec: kubevirtv1.VirtualMachineInstanceMigrationSpec{VMIName: vmName},
+				Status: kubevirtv1.VirtualMachineInstanceMigrationStatus{
+					Phase: kubevirtv1.MigrationSucceeded,
+					MigrationState: &kubevirtv1.VirtualMachineInstanceMigrationState{
+						Completed:    true,
+						SourcePod:    sourcePodName,
+						TargetPod:    targetPodName,
+						EndTimestamp: &now,
+					},
+				},
+			},
+			sourcePod:          nil,
+			expectPodDeleted:   true,
+			expectEnqueueAfter: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientset := fakecore.NewSimpleClientset()
+			harvFakeClient := fakegenerated.NewSimpleClientset()
+
+			assert.NoError(t, harvFakeClient.Tracker().Add(tt.vmi), errMockTrackerAdd)
+			assert.NoError(t, harvFakeClient.Tracker().Add(tt.vmim), errMockTrackerAdd)
+			if tt.sourcePod != nil {
+				assert.NoError(t, harvFakeClient.Tracker().Add(tt.sourcePod), errMockTrackerAdd)
+			}
+
+			fakeVMIMCtrl := &fakeVMIMController{}
+			h := &Handler{
+				rqs:            fakeclients.ResourceQuotaClient(clientset.CoreV1().ResourceQuotas),
+				rqCache:        fakeclients.ResourceQuotaCache(clientset.CoreV1().ResourceQuotas),
+				nsCache:        fakeclients.NamespaceCache(clientset.CoreV1().Namespaces),
+				vmiCache:       fakeclients.VirtualMachineInstanceCache(harvFakeClient.KubevirtV1().VirtualMachineInstances),
+				vmCache:        fakeclients.VirtualMachineCache(harvFakeClient.KubevirtV1().VirtualMachines),
+				pods:           fakeclients.PodClient(harvFakeClient.CoreV1().Pods),
+				podCache:       fakeclients.PodCache(harvFakeClient.CoreV1().Pods),
+				vmimController: fakeVMIMCtrl,
+			}
+
+			_, err := h.OnVmimChanged("", tt.vmim)
+			assert.NoError(t, err)
+
+			_, getErr := h.podCache.Get(ns, sourcePodName)
+			if tt.expectPodDeleted {
+				assert.True(t, apierrors.IsNotFound(getErr), "expected source pod to be deleted, got err=%v", getErr)
+			} else {
+				assert.NoError(t, getErr, "expected source pod to remain")
+			}
+
+			if tt.expectEnqueueAfter {
+				assert.Equal(t, []string{ns + "/" + vmimName}, fakeVMIMCtrl.enqueuedAfter)
+			} else {
+				assert.Empty(t, fakeVMIMCtrl.enqueuedAfter)
+			}
 		})
 	}
 }
